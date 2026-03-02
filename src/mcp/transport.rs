@@ -229,12 +229,13 @@ impl McpTransport for StdioTransport {
 /// SSE-based MCP transport: sends JSON-RPC over HTTP POST, receives via SSE.
 pub struct SseTransport {
     url: String,
+    headers: HashMap<String, String>,
     client: reqwest::Client,
     alive: AtomicBool,
 }
 
 impl SseTransport {
-    pub fn new(url: &str, timeout_secs: u64) -> Self {
+    pub fn new(url: &str, headers: HashMap<String, String>, timeout_secs: u64) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
@@ -242,6 +243,7 @@ impl SseTransport {
 
         Self {
             url: url.to_string(),
+            headers,
             client,
             alive: AtomicBool::new(true),
         }
@@ -251,10 +253,11 @@ impl SseTransport {
 #[async_trait]
 impl McpTransport for SseTransport {
     async fn send(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse> {
-        let resp = self
-            .client
-            .post(&self.url)
-            .json(request)
+        let mut req = self.client.post(&self.url).json(request);
+        for (key, val) in &self.headers {
+            req = req.header(key.as_str(), val.as_str());
+        }
+        let resp = req
             .send()
             .await
             .context("SSE transport: POST failed")?;

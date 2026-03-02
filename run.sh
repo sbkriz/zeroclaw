@@ -26,4 +26,4 @@ fi
 
 export ANTHROPIC_OAUTH_TOKEN="$TOKEN"
 
-exec cargo run --release -- "$@"
+exec ./target/release/zeroclaw "$@"

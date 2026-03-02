@@ -349,6 +349,12 @@ impl SecurityPolicy {
             return false;
         }
 
+        // Full autonomy with wildcard allowlist: pass through like a real terminal
+        let is_wildcard = self.allowed_commands.iter().any(|a| a == "*");
+        if self.autonomy == AutonomyLevel::Full && is_wildcard {
+            return !command.trim().is_empty();
+        }
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
         if command.contains('`')
@@ -410,7 +416,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| allowed == base_cmd)
+                .any(|allowed| allowed == "*" || allowed == base_cmd)
             {
                 return false;
             }
