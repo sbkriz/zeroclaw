@@ -55,10 +55,25 @@ impl McpManager {
             }
         }
 
+        // Deduplicate by name — some MCP servers register the same tool twice.
+        // Keep the first occurrence; warn on any dropped duplicates.
+        let mut seen = std::collections::HashSet::new();
+        let mut dedup_count = 0usize;
+        tools.retain(|t| {
+            if seen.insert(t.name().to_string()) {
+                true
+            } else {
+                dedup_count += 1;
+                tracing::warn!(tool = %t.name(), "Duplicate MCP tool name — dropping second registration");
+                false
+            }
+        });
+
         if !tools.is_empty() {
             tracing::info!(
                 servers = clients.len(),
                 total_tools = tools.len(),
+                duplicates_dropped = dedup_count,
                 "MCP tools registered"
             );
         }
@@ -104,12 +119,12 @@ async fn connect_server(
 ) -> Result<(Arc<McpClient>, Vec<Box<dyn Tool>>)> {
     // Create transport
     let transport: Box<dyn transport::McpTransport> = match config.transport.as_str() {
-        "sse" => {
+        "sse" | "http" => {
             let url = config
                 .url
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("SSE transport requires 'url'"))?;
-            Box::new(SseTransport::new(url, config.timeout_secs))
+                .ok_or_else(|| anyhow::anyhow!("SSE/HTTP transport requires 'url'"))?;
+            Box::new(SseTransport::new(url, config.headers.clone(), config.timeout_secs))
         }
         _ => {
             // Default: stdio
