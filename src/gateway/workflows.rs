@@ -183,6 +183,7 @@ pub async fn handle_run(
             temperature,
             true,
             Some(&mut records),
+            None,
         )
         .await
         {

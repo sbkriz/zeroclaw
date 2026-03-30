@@ -13,7 +13,7 @@ pub mod memory_api;
 pub mod responses;
 pub mod workflows;
 
-use crate::agent::loop_::{agent_turn, build_tool_instructions, ToolCallRecord};
+use crate::agent::loop_::{agent_turn, build_tool_instructions, StreamEvent, ToolCallRecord};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -45,8 +45,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (10MB)
 pub const MAX_BODY_SIZE: usize = 10_485_760;
-/// Request timeout (600s) — 10 minutes for long agent tasks
-pub const REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Request timeout (900s) — 15 minutes for multi-step agent tasks (browser + DB workflows)
+pub const REQUEST_TIMEOUT_SECS: u64 = 900;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -329,7 +329,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    // Only inject prompt-based tool instructions when the provider does NOT support
+    // native tool calling. Native-tool providers (Anthropic, OpenAI) send structured
+    // tool definitions via the API — duplicating them in the system prompt wastes
+    // tokens (can exceed the 200k context limit with 50+ tools) and confuses the
+    // model into emitting raw XML instead of using structured tool calls.
+    if !provider.supports_native_tools() {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
     let system_prompt: Arc<str> = Arc::from(system_prompt);
     let config = Arc::new(config);
     // Extract webhook secret for authentication
@@ -640,12 +647,26 @@ pub struct WebhookBody {
     pub images: Vec<ImageAttachment>,
 }
 
-/// POST /webhook — main webhook endpoint
+/// Returns true if the client wants SSE streaming (`Accept: text/event-stream`).
+fn wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+/// Format a single SSE frame.
+fn sse_frame(event_type: &str, data: &str) -> String {
+    format!("event: {event_type}\ndata: {data}\n\n")
+}
+
+/// POST /webhook — main webhook endpoint (JSON or SSE streaming)
 async fn handle_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let client_key = client_key_from_headers(&headers);
     if !state.rate_limiter.allow_webhook(&client_key) {
         tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
@@ -653,13 +674,13 @@ async fn handle_webhook(
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
     }
 
     // ── Bearer token auth (pairing) ──
     if let Err(resp) = auth::require_auth(&state.pairing, &headers) {
         tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-        return resp;
+        return resp.into_response();
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
@@ -675,7 +696,7 @@ async fn handle_webhook(
             _ => {
                 tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Secret");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
             }
         }
     }
@@ -688,7 +709,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -706,13 +727,11 @@ async fn handle_webhook(
                 "idempotent": true,
                 "message": "Request already processed for this idempotency key"
             });
-            return (StatusCode::OK, Json(body));
+            return (StatusCode::OK, Json(body)).into_response();
         }
     }
 
     // Route image attachments based on provider vision capability.
-    // Only Anthropic supports multimodal content blocks; all other providers
-    // receive a plain-text fallback note so they don't see raw JSON.
     let message_content: String = if !webhook_body.images.is_empty() {
         if state.provider_name == "anthropic" {
             let images_json: Vec<serde_json::Value> = webhook_body
@@ -788,7 +807,12 @@ async fn handle_webhook(
 
     history.push(ChatMessage::user(message.to_string()));
 
-    // Run full agent loop with tools
+    // ── SSE streaming path ──
+    if wants_sse(&headers) {
+        return handle_webhook_stream(state, history, message.clone(), conversation_id.map(String::from)).await;
+    }
+
+    // ── Synchronous JSON path (original behavior) ──
     let mut tool_records: Vec<ToolCallRecord> = Vec::new();
     match agent_turn(
         state.provider.as_ref(),
@@ -800,12 +824,13 @@ async fn handle_webhook(
         state.temperature,
         true,
         Some(&mut tool_records),
+        None,
     )
     .await
     {
         Ok(response) => {
             // ── Persist conversation messages if conversation_id is present ──
-            if let (Some(conv_id), Some(ref store)) = (conversation_id, &state.conversation_store) {
+            if let (Some(conv_id), Some(ref store)) = (conversation_id.as_deref(), &state.conversation_store) {
                 if let Err(e) = store.append_message(conv_id, "user", message, None) {
                     tracing::warn!("Failed to persist user message for conversation {conv_id}: {e}");
                 }
@@ -827,7 +852,7 @@ async fn handle_webhook(
             if let Some(conv_id) = conversation_id {
                 body["conversation_id"] = serde_json::Value::String(conv_id.to_string());
             }
-            (StatusCode::OK, Json(body))
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
             tracing::error!(
@@ -835,9 +860,114 @@ async fn handle_webhook(
                 providers::sanitize_api_error(&e.to_string())
             );
             let err = serde_json::json!({"error": "Agent request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
         }
     }
+}
+
+/// SSE streaming webhook handler — spawns the agent loop and bridges events to an SSE stream.
+async fn handle_webhook_stream(
+    state: AppState,
+    mut history: Vec<ChatMessage>,
+    message: String,
+    conversation_id: Option<String>,
+) -> axum::response::Response {
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<StreamEvent>(32);
+
+    let conv_id = conversation_id.clone();
+
+    // Spawn agent loop in background — sends StreamEvents through the channel.
+    tokio::spawn(async move {
+        let mut tool_records: Vec<ToolCallRecord> = Vec::new();
+        let result = agent_turn(
+            state.provider.as_ref(),
+            &mut history,
+            &state.tools_registry,
+            state.observer.as_ref(),
+            &state.provider_name,
+            &state.model,
+            state.temperature,
+            true,
+            Some(&mut tool_records),
+            Some(stream_tx.clone()),
+        )
+        .await;
+
+        match result {
+            Ok(response) => {
+                // Persist conversation
+                if let (Some(conv_id), Some(ref store)) =
+                    (conv_id.as_deref(), &state.conversation_store)
+                {
+                    let _ = store.append_message(conv_id, "user", &message, None);
+                    let tool_calls_json = if tool_records.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&tool_records).ok()
+                    };
+                    let _ = store.append_message(
+                        conv_id,
+                        "assistant",
+                        &response,
+                        tool_calls_json.as_deref(),
+                    );
+                }
+
+                let _ = stream_tx
+                    .send(StreamEvent::Done {
+                        response,
+                        model: Some(state.model.clone()),
+                        conversation_id: conv_id.clone(),
+                        tool_calls: tool_records,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Webhook SSE agent error: {}",
+                    providers::sanitize_api_error(&e.to_string())
+                );
+                let _ = stream_tx
+                    .send(StreamEvent::Error {
+                        message: "Agent request failed".into(),
+                    })
+                    .await;
+            }
+        }
+        // stream_tx drops here, closing the channel
+    });
+
+    // Convert the mpsc receiver into an SSE byte stream using futures::stream::unfold.
+    let stream = futures::stream::unfold(stream_rx, |mut rx| async move {
+        let event = rx.recv().await?;
+        let (event_type, data) = match &event {
+            StreamEvent::Status { .. } => ("status", serde_json::to_string(&event)),
+            StreamEvent::Text { .. } => ("text", serde_json::to_string(&event)),
+            StreamEvent::ToolCall { .. } => ("tool_call", serde_json::to_string(&event)),
+            StreamEvent::ToolResult { .. } => ("tool_result", serde_json::to_string(&event)),
+            StreamEvent::Done { .. } => ("done", serde_json::to_string(&event)),
+            StreamEvent::Error { .. } => ("error", serde_json::to_string(&event)),
+        };
+        let frame = match data {
+            Ok(json) => sse_frame(event_type, &json),
+            Err(_) => String::new(),
+        };
+        Some((Ok::<_, std::convert::Infallible>(frame), rx))
+    });
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to create SSE stream"})),
+            )
+                .into_response()
+        })
 }
 
 /// `WhatsApp` verification query params

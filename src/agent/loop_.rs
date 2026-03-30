@@ -9,14 +9,16 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use serde::Serialize;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+const MAX_TOOL_ITERATIONS: usize = 30;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -414,7 +416,17 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             text_parts.push(before.trim().to_string());
         }
 
-        if let Some(end) = remaining[start..].find("</tool_call>") {
+        // Accept both </tool_call> and </invoke> as closing tags — models
+        // occasionally emit the wrong closing tag which previously caused
+        // the tool call to be returned as raw text instead of being executed.
+        let close_tag_result = remaining[start..]
+            .find("</tool_call>")
+            .map(|pos| (pos, 12usize))
+            .or_else(|| {
+                remaining[start..].find("</invoke>").map(|pos| (pos, 9usize))
+            });
+
+        if let Some((end, close_len)) = close_tag_result {
             let inner = &remaining[start + 11..start + end];
             let mut parsed_any = false;
             let json_values = extract_json_values(inner);
@@ -430,7 +442,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
             }
 
-            remaining = &remaining[start + end + 12..];
+            remaining = &remaining[start + end + close_len..];
         } else {
             break;
         }
@@ -500,6 +512,38 @@ pub struct ToolCallRecord {
     pub duration_ms: u64,
 }
 
+/// Events emitted during the agent loop for SSE streaming.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    Status {
+        status: String,
+        iteration: usize,
+        total: usize,
+    },
+    Text {
+        delta: String,
+    },
+    ToolCall {
+        name: String,
+        status: String,
+    },
+    ToolResult {
+        name: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    Done {
+        response: String,
+        model: Option<String>,
+        conversation_id: Option<String>,
+        tool_calls: Vec<ToolCallRecord>,
+    },
+    Error {
+        message: String,
+    },
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -515,6 +559,7 @@ pub(crate) async fn agent_turn(
     temperature: f64,
     silent: bool,
     tool_records: Option<&mut Vec<ToolCallRecord>>,
+    stream_tx: Option<mpsc::Sender<StreamEvent>>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -528,6 +573,7 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         tool_records,
+        stream_tx,
     )
     .await
 }
@@ -547,6 +593,7 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     mut tool_records: Option<&mut Vec<ToolCallRecord>>,
+    stream_tx: Option<mpsc::Sender<StreamEvent>>,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -556,7 +603,17 @@ pub(crate) async fn run_tool_call_loop(
         Vec::new()
     };
 
-    for _iteration in 0..MAX_TOOL_ITERATIONS {
+    for iteration in 0..MAX_TOOL_ITERATIONS {
+        if let Some(ref tx) = stream_tx {
+            let _ = tx
+                .send(StreamEvent::Status {
+                    status: "thinking".into(),
+                    iteration: iteration + 1,
+                    total: MAX_TOOL_ITERATIONS,
+                })
+                .await;
+        }
+
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -657,6 +714,13 @@ pub(crate) async fn run_tool_call_loop(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
+            if let Some(ref tx) = stream_tx {
+                let _ = tx
+                    .send(StreamEvent::Text {
+                        delta: display_text.clone(),
+                    })
+                    .await;
+            }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
         }
@@ -698,6 +762,14 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            if let Some(ref tx) = stream_tx {
+                let _ = tx
+                    .send(StreamEvent::ToolCall {
+                        name: call.name.clone(),
+                        status: "started".into(),
+                    })
+                    .await;
+            }
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
@@ -732,13 +804,26 @@ pub(crate) async fn run_tool_call_loop(
                 (format!("Unknown tool: {}", call.name), false)
             };
 
+            let tool_duration_ms =
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            if let Some(ref tx) = stream_tx {
+                let _ = tx
+                    .send(StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        success: tool_success,
+                        duration_ms: tool_duration_ms,
+                    })
+                    .await;
+            }
+
             if let Some(records) = &mut tool_records {
                 records.push(ToolCallRecord {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     result: result.clone(),
                     success: tool_success,
-                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    duration_ms: tool_duration_ms,
                 });
             }
 
@@ -754,6 +839,15 @@ pub(crate) async fn run_tool_call_loop(
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
+    if let Some(ref tx) = stream_tx {
+        let _ = tx
+            .send(StreamEvent::Error {
+                message: format!(
+                    "Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})"
+                ),
+            })
+            .await;
+    }
     anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
 }
 
@@ -1075,6 +1169,7 @@ pub async fn run(
             Some(&approval_manager),
             "cli",
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1154,6 +1249,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
                 None,
             )
             .await
@@ -1371,6 +1467,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        None,
         None,
     )
     .await
@@ -1839,7 +1936,7 @@ Done."#;
 
     const _: () = {
         assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
+        assert!(MAX_TOOL_ITERATIONS <= 200);
         assert!(MAX_HISTORY_MESSAGES > 0);
         assert!(MAX_HISTORY_MESSAGES <= 1000);
     };

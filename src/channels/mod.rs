@@ -218,6 +218,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             None,
             msg.channel.as_str(),
             None,
+            None, // no SSE streaming for channel messages
         ),
     )
     .await;
